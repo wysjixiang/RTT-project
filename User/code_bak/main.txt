@@ -1,0 +1,1004 @@
+/********************************** (C) COPYRIGHT *******************************
+* File Name          : main.c
+* Author             : WCH
+* Version            : V1.0.0
+* Date               : 2020/04/30
+* Description        : Main program body.
+*********************************************************************************
+* Copyright (c) 2021 Nanjing Qinheng Microelectronics Co., Ltd.
+* Attention: This software (modified or not) and binary are used for 
+* microcontroller manufactured by Nanjing Qinheng Microelectronics.
+*******************************************************************************/
+#include "ch32v30x.h"
+#include <rtthread.h>
+#include <rthw.h>
+#include <rtdef.h>
+#include "drivers/pin.h"
+#include "Func.h"
+#include "peri_config.h"
+#include "drivers/user_timer.h"
+#include "drv_timer.h"
+
+// Version： DtwMapping_FinalVersion
+//  2022/8/10
+// 更改匹配策略，采用比较模式来判别，放弃阈值门限方式
+// 优化菜单界面-删去cleartemplate功能，增加waveform展示波形功能
+// 修改模板获取代码Gettemplate函数
+// 修改模板训练算法，采用类粒子群算法，找出全局最优的模板
+// DTW最后计算中包含了欧式距离的权重
+
+// Thread
+
+/* Global define */
+#define THREAD_STACK_SIZE  512
+#define THREAD_PRIORITY 10
+#define THREAD_TIMESLICE 10
+
+/* Global Var  */
+
+// semaphore
+struct rt_semaphore sem_key_lock;
+struct rt_semaphore sem_menu_lock;
+static rt_mutex_t mutex_lock;
+
+// static thread init
+/* 定义线程控栈时要求RT_ALIGN_SIZE个字节对齐 */
+ALIGN(RT_ALIGN_SIZE)
+/* 定义线程栈 */
+static rt_uint8_t rt_LCD_thread_stack[1024];
+static rt_uint8_t rt_DTW_thread_stack[1024];
+static rt_uint8_t rt_TEST_thread_stack[1024];
+/* 定义线程控制块 */
+static struct rt_thread LCD_thread;
+static struct rt_thread DTW_thread;
+static struct rt_thread TEST_thread;
+
+/* Global Variant */
+volatile u16 Thresh = 300;      //用于判定有效信息起始的阈值数值
+volatile u16 JudgeThresh = 400;
+//参数
+volatile float fac_dtw = 0.75;      // DTW的权重
+volatile float fac_Odist = 0.25;    //欧式距离的权重
+volatile u32 MedistanceValue[4];    //欧式距离变量
+volatile u32 Finaldist[4];          //最终DTW表征值
+volatile uint16_t LaserFlag = 0; // 全局变量,表征激光发光or不发光
+volatile uint16_t TIMProcessFlag = 0;//全局变量，表征是否重新执行了一次定时器的中断函数
+volatile u16 *p_AdcDmaData = NULL;  // 用于存储ADC采集的数据
+volatile u16 DataLaserOn = 0;       //激光亮灭标志位
+volatile u16 DataLaserOff = 0;      //标志位
+volatile u16 DifData = 0;           //预处理后的一个数据点
+volatile uint16_t DMAProcessFlag = 0;  //DMA标志位，DMA传送完成后置1
+volatile u16 ThreshVolt = 0;     //定义临界电压值，用来判定是否为导轨光信号
+volatile u16 *DataStream = NULL; //DataStream数据流，有效传感数据都被存储在这个数组内
+volatile u8 offset_p = 0;   // 用于定位当前时间点下数据点在DataStream数组内的起始位置
+volatile u8 DTWDataState = 0;   //表征DTW匹配时候的状态
+volatile u32 BestDtwValue[4];
+
+// 用于控制LCD屏幕主菜单
+volatile u8 KeyValue = 10;  //键值
+volatile u8 LcdScreen =0;
+static u8 LcdScreenSubOption = 0;
+volatile u8 DtwRun = 0;
+volatile u8 TemplateWanted = 0;
+volatile u8 StateFlag = 1;
+volatile u8 KeyReg = 0;
+// 用于控制LCD屏幕主菜单
+
+volatile u8 mallocFlag = 0; //标志位
+ /* Local Variant */
+
+// 用于计数
+u8 k=0;
+u8 kk=0;
+u8 i_dtw =0;
+u8 j_dtw = 0;
+u8 k_dtw = 0;
+u8 cnt_state = 0;
+// 用于计数
+
+// 模板数据在FLASH内存储的位置
+uint32_t AddrTemp[4] = {AddrTemplate3,AddrTemplate4,AddrTemplate6,AddrTemplate7 };
+uint32_t AddrTempSize[4] = {AddrTemplate3_size,AddrTemplate4_size,
+                                    AddrTemplate6_size,AddrTemplate7_size};
+uint32_t AddrTempPeak[4] = {AddrTemplate3_Peak,AddrTemplate4_Peak,
+                            AddrTemplate6_Peak,AddrTemplate7_Peak};
+
+
+// func init
+void peripheral_init();
+void LCD_thread_entry(void *param);
+void DTW_thread_entry(void *param);
+int thread_sema_init();
+void user_timer_init();
+
+
+int main(void)
+{
+    int err;
+    Delay_Init();
+    main_init();
+
+    err = key_init();
+
+    if(err != RT_NULL){
+        rt_kprintf("key init error\r\n");
+        return -1;
+    } else{
+        rt_kprintf("key init success!\r\n");
+    }
+
+    peripheral_init();
+    rt_kprintf("Peripheral init success!\r\n");
+
+    // init thread & sema
+    thread_sema_init();
+
+
+    return 0;
+}
+
+
+
+void LCD_thread_entry(void *param){
+
+    // first hold mutex
+    rt_mutex_take(mutex_lock, RT_WAITING_FOREVER);
+
+    // get sema and show Menu
+    rt_sem_take(&sem_menu_lock, RT_WAITING_FOREVER);
+
+
+    while(1){
+        //先显示主菜单
+        DrawMenu(LcdScreen,LcdScreenSubOption);
+
+        //先循环检测键值，等到获取了键值再进行下一步处理
+        rt_sem_take(&sem_key_lock, RT_WAITING_FOREVER);
+        KeyReg = KeyValue;
+        while(LcdScreen == Drop){
+            rt_thread_mdelay(500);
+        }
+
+        // ParameterMod主选项
+        if(LcdScreen == ParameterMod)
+        {
+            // 子选项
+            if(LcdScreenSubOption == 0)
+            {
+                switch(KeyReg)
+                {
+                case Confirm:
+                    LcdScreenSubOption = 1;
+                    break;
+                case Up:
+                    LcdScreen = RunDtw;
+                    break;
+                case Down:
+                    LcdScreen = TemplateTraining;
+                    break;
+                default:
+                    break;
+                }
+            }
+            else if(LcdScreenSubOption != 0)
+            {
+                switch(LcdScreenSubOption)
+                {
+                case 1:
+                    switch(KeyReg)
+                    {
+                    case Confirm:
+                        LcdScreenSubOption = 2;
+                        break;
+                    case Up:
+                        if(fac_dtw <0.99)fac_dtw+=0.01;
+                        break;
+                    case Down:
+                        if(fac_dtw >0.5)fac_dtw-=0.01;
+                        break;
+                    case Back:
+                        LcdScreenSubOption = 0;
+                        break;
+                    }
+                    break;
+                case 2:
+                    switch(KeyReg)
+                    {
+                    case Confirm:
+                        LcdScreenSubOption = 3;
+                        break;
+                    case Up:
+                        if(fac_Odist < 0.99)  fac_Odist+=0.01;
+                        break;
+                    case Down:
+                        if(fac_Odist > 0.1)fac_Odist-=0.01;
+                        break;
+                    case Back:
+                        LcdScreenSubOption--;
+                        break;
+                    }
+                    break;
+                case 3:
+                    switch(KeyReg)
+                    {
+                    case Confirm:
+                        LcdScreenSubOption = 4;
+                        break;
+                    case Up:
+                        if(Thresh <500)Thresh+=10;
+                        break;
+                    case Down:
+                        if(Thresh >100)Thresh-=10;
+                        break;
+                    case Back:
+                        LcdScreenSubOption--;
+                        break;
+                    }
+                    break;
+                case 4:
+                    switch(KeyReg)
+                    {
+                    case Confirm:
+                        LcdScreenSubOption = 0;
+                        lcd_clear(BLACK);
+                        lcd_show_string(20, 80, 24, "Modify Done");
+                        Delay_Ms(1000);
+                        break;
+                    case Up:
+                        if(JudgeThresh < 500) JudgeThresh+=10;
+                        break;
+                    case Down:
+                        if(JudgeThresh > 300) JudgeThresh-=10;
+                        break;
+                    case Back:
+                        LcdScreenSubOption--;
+                        break;
+                    }
+                    break;
+                case 5:
+                    switch(KeyReg)
+                    {
+                    case Confirm:
+                        LcdScreenSubOption = 0;
+                        lcd_clear(BLACK);
+                        lcd_show_string(20, 80, 24, "Modify Done");
+                        Delay_Ms(2000);
+                        break;
+                    case Up:
+                        //if(w <max_w) w+=1;
+                        break;
+                    case Down:
+                        //if(w >5) w -=1;
+                        break;
+                    case Back:
+                        LcdScreenSubOption--;
+                        break;
+                    }
+                    break;
+                }
+            }
+        }
+        // TemplateTraining 主选项
+        else if(LcdScreen == TemplateTraining)
+        {
+            if(LcdScreenSubOption == 0)
+            {
+                switch(KeyReg)
+                {
+                    case Confirm:
+                        LcdScreenSubOption = 1;
+                        break;
+                    case Up:
+                        LcdScreen = ParameterMod;
+                        break;
+                    case Down:
+                        LcdScreen = Waveform;
+                        break;
+                    case Back:
+                        LcdScreen = ParameterMod;
+                        break;
+                    default: break;
+                }
+            }
+            else if(LcdScreenSubOption == 1)
+            {
+                switch(KeyReg)
+                {
+                    case Confirm:
+                        LcdScreenSubOption = 7;
+                        break;
+                    case Up:
+                        LcdScreenSubOption = 2;
+                        break;
+                    case Down:
+                        LcdScreenSubOption = 2;
+                        break;
+                    case Back:
+                        LcdScreenSubOption = 0;
+                        break;
+                    default: break;
+                }
+            }
+
+            else if(LcdScreenSubOption == 7)
+            {
+                switch(KeyReg)
+                {
+                case Confirm:
+                    //fasttraining(Template_Sample,LcdScreenSubOption-7); // 快速训练模式
+                    //最后要往Flash的一个固定地址里面写一个标志位，开机检查这个标志位是否为挂起状态，
+                    //这样来判断模板数据是否保存在Flash里。
+                    FLASH_Unlock();
+                    FLASH_ProgramHalfWord(AddrTemplateWrittenDone, 0xF |
+                            *(__IO uint16_t *)AddrTemplateWrittenDone);
+                    FLASH_Lock();
+                    LcdScreenSubOption = 8;
+                    break;
+                case Up:
+                    LcdScreenSubOption = 10;
+                    break;
+                case Down:
+                    LcdScreenSubOption = 8;
+                    break;
+                case Back:
+                    LcdScreenSubOption = 1;
+                    break;
+                }
+            }
+
+            else if(LcdScreenSubOption == 8)
+            {
+                switch(KeyReg)
+                {
+                case Confirm:
+                    //fasttraining(Template_Sample,LcdScreenSubOption-7); // 快速训练模式
+                    //最后要往Flash的一个固定地址里面写一个标志位，开机检查这个标志位是否为挂起状态，这样来判断模板数据是否保存在
+                    //Flash里。
+                    FLASH_Unlock();
+                    FLASH_ProgramHalfWord(AddrTemplateWrittenDone, 0xF0 |
+                            *(__IO uint16_t *)AddrTemplateWrittenDone);
+                    FLASH_Lock();
+                    LcdScreenSubOption = 9;
+                    break;
+                case Up:
+                    LcdScreenSubOption = 7;
+                    break;
+                case Down:
+                    LcdScreenSubOption = 9;
+                    break;
+                case Back:
+                    LcdScreenSubOption = 1;
+                    break;
+                }
+            }
+            else if(LcdScreenSubOption == 9)
+            {
+                switch(KeyReg)
+                {
+                case Confirm:
+                    //fasttraining(Template_Sample,LcdScreenSubOption-7); // 快速训练模式
+                    //最后要往Flash的一个固定地址里面写一个标志位，开机检查这个标志位是否为挂起状态，这样来判断模板数据是否保存在
+                    //Flash里。
+                    FLASH_Unlock();
+                    FLASH_ProgramHalfWord(AddrTemplateWrittenDone, 0xF00 |
+                            *(__IO uint16_t *)AddrTemplateWrittenDone);
+                    FLASH_Lock();
+                    LcdScreenSubOption = 10;
+                    break;
+                case Up:
+                    LcdScreenSubOption = 8;
+                    break;
+                case Down:
+                    LcdScreenSubOption = 10;
+                    break;
+                case Back:
+                    LcdScreenSubOption = 1;
+                    break;
+                }
+            }
+            else if(LcdScreenSubOption == 10)
+            {
+                switch(KeyReg)
+                {
+                case Confirm:
+                    //fasttraining(Template_Sample,LcdScreenSubOption-7); // 快速训练模式
+                    //最后要往Flash的一个固定地址里面写一个标志位，开机检查这个标志位是否为挂起状态，这样来判断模板数据是否保存在
+                    //Flash里。
+                    FLASH_Unlock();
+                    FLASH_ProgramHalfWord(AddrTemplateWrittenDone, 0xF000 |
+                            *(__IO uint16_t *)AddrTemplateWrittenDone);
+                    FLASH_Lock();
+                    LcdScreenSubOption = 7;
+                    break;
+                case Up:
+                    LcdScreenSubOption = 9;
+                    break;
+                case Down:
+                    LcdScreenSubOption = 7;
+                    break;
+                case Back:
+                    LcdScreenSubOption = 1;
+                    break;
+                }
+            }
+
+            else if(LcdScreenSubOption == 2)
+            {
+                switch(KeyReg)
+                {
+                case Confirm:
+                    LcdScreenSubOption = 3;
+                    break;
+                case Up:
+                    LcdScreenSubOption = 1;
+                    break;
+                case Down:
+                    LcdScreenSubOption = 1;
+                    break;
+                case Back:
+                    LcdScreenSubOption = 0;
+                    break;
+                }
+            }
+            else if(LcdScreenSubOption == 3)
+            {
+                switch(KeyReg)
+                {
+                case Confirm:
+                    lcd_clear(BLACK);
+                    lcd_show_string(40, 80, 24, "Template-%d Training",(LcdScreenSubOption-3));
+                    Delay_Ms(1000);
+                    //train(Template_Sample,LcdScreenSubOption-3);
+                    //最后要往Flash的一个固定地址里面写一个标志位，开机检查这个标志位是否为挂起状态，这样来判断模板数据是否保存在
+                    //Flash里。
+                    FLASH_Unlock();
+                    FLASH_ProgramHalfWord(AddrTemplateWrittenDone, 0xF |
+                            *(__IO uint16_t *)AddrTemplateWrittenDone);
+                    FLASH_Lock();
+                    LcdScreenSubOption = 4;
+                    break;
+                case Up:
+                    LcdScreenSubOption = 6;
+                    break;
+                case Down:
+                    LcdScreenSubOption = 4;
+                    break;
+                case Back:
+                    LcdScreenSubOption = 2;
+                    break;
+                }
+
+            }
+            else if(LcdScreenSubOption == 4)
+            {
+                switch(KeyReg)
+                {
+                case Confirm:
+                    lcd_clear(BLACK);
+                    lcd_show_string(40, 80, 24, "Template-%d Training",(LcdScreenSubOption-3));
+                    Delay_Ms(1000);
+                    //train(Template_Sample,LcdScreenSubOption-3);
+                    //最后要往Flash的一个固定地址里面写一个标志位，开机检查这个标志位是否为挂起状态，这样来判断模板数据是否保存在
+                    //Flash里。
+                    FLASH_Unlock();
+                    FLASH_ProgramHalfWord(AddrTemplateWrittenDone, 0xF0 |
+                            *(__IO uint16_t *)AddrTemplateWrittenDone);
+                    FLASH_Lock();
+                    LcdScreenSubOption = 5;
+                    break;
+                case Up:
+                    LcdScreenSubOption = 3;
+                    break;
+                case Down:
+                    LcdScreenSubOption = 5;
+                    break;
+                case Back:
+                    LcdScreenSubOption = 2;
+                    break;
+                }
+            }
+            else if(LcdScreenSubOption == 5)
+            {
+                switch(KeyReg)
+                {
+                case Confirm:
+                    lcd_clear(BLACK);
+                    lcd_show_string(40, 80, 24, "Template-%d Training",(LcdScreenSubOption-3));
+                    Delay_Ms(1000);
+                    //train(Template_Sample,LcdScreenSubOption-3);
+                    //最后要往Flash的一个固定地址里面写一个标志位，开机检查这个标志位是否为挂起状态，这样来判断模板数据是否保存在
+                    //Flash里。
+                    FLASH_Unlock();
+                    FLASH_ProgramHalfWord(AddrTemplateWrittenDone, 0xF00 |
+                            *(__IO uint16_t *)AddrTemplateWrittenDone);
+                    FLASH_Lock();
+                    LcdScreenSubOption = 6;
+                    break;
+                case Up:
+                    LcdScreenSubOption = 4;
+                    break;
+                case Down:
+                    LcdScreenSubOption = 6;
+                    break;
+                case Back:
+                    LcdScreenSubOption = 2;
+                    break;
+                }
+            }
+            else if(LcdScreenSubOption == 6)
+            {
+                switch(KeyReg)
+                {
+                case Confirm:
+                    lcd_clear(BLACK);
+                    lcd_show_string(40, 80, 24, "Template-%d Training",(LcdScreenSubOption-3));
+                    Delay_Ms(1000);
+                    //train(Template_Sample,LcdScreenSubOption-3);
+                    //最后要往Flash的一个固定地址里面写一个标志位，开机检查这个标志位是否为挂起状态，这样来判断模板数据是否保存在
+                    //Flash里。
+                    FLASH_Unlock();
+                    FLASH_ProgramHalfWord(AddrTemplateWrittenDone, 0xF000 |
+                            *(__IO uint16_t *)AddrTemplateWrittenDone);
+                    FLASH_Lock();
+                    LcdScreenSubOption = 2;
+                    break;
+                case Up:
+                    LcdScreenSubOption = 5;
+                    break;
+                case Down:
+                    LcdScreenSubOption = 3;
+                    break;
+                case Back:
+                    LcdScreenSubOption = 2;
+                    break;
+                }
+            }
+
+        }
+        // Waveform 主选项
+        else if(LcdScreen == Waveform)
+        {
+            switch(LcdScreenSubOption)
+            {
+                case 0:
+                    switch(KeyReg)
+                    {
+                    case Confirm:
+                        LcdScreenSubOption = 1;
+                        break;
+                    case Up:
+                        LcdScreen = 2;
+                        break;
+                    case Down:
+                        LcdScreen = 4;
+                        break;
+                    case Back:
+                        break;
+                    }
+                    break;
+
+                case 1:
+                    switch(KeyReg)
+                    {
+                    case Confirm:
+                        //首先检查标志位是否一致，判断FLASH中是否已经存储着数据
+                        if(0x000F == ((*(__IO uint16_t *)AddrTemplateWrittenDone) & 0x000F) )
+                        {
+                            DrawCurve((u16 *)AddrTemp[LcdScreenSubOption-1],
+                                    *((__IO uint16_t *)AddrTempSize[LcdScreenSubOption-1]));
+                            Delay_Ms(WaveTime_Ms);
+
+                        }
+                        //如果没有数据，即还没有训练得到模板，则LCD显示下列信息
+                        else {
+                            lcd_clear(BLACK);
+                            lcd_show_string(20, 80, 24, "No Template Data!");
+                            lcd_show_string(20, 160, 24, "Do Training First!");
+                            Delay_Ms(1000);
+                        }
+                        break;
+                    case Up:
+                        LcdScreenSubOption = 4;
+                        break;
+                    case Down:
+                        LcdScreenSubOption = 2;
+                        break;
+                    case Back:
+                        LcdScreenSubOption = 0;
+                        break;
+                    }
+                    break;
+
+                case 2:
+                    switch(KeyReg)
+                    {
+                    case Confirm:
+                        if(0x00F0 == ((*(__IO uint16_t *)AddrTemplateWrittenDone) & 0x00F0))
+                        {
+                            DrawCurve((u16 *)AddrTemp[LcdScreenSubOption-1],
+                                    *((__IO uint16_t *)AddrTempSize[LcdScreenSubOption-1]));
+                            Delay_Ms(WaveTime_Ms);
+
+                        }
+                        else {
+                            lcd_clear(BLACK);
+                            lcd_show_string(20, 80, 24, "No Template Data!");
+                            lcd_show_string(20, 160, 24, "Do Training First!");
+                            Delay_Ms(1000);
+                        }
+                        break;
+                    case Up:
+                        LcdScreenSubOption = 1;
+                        break;
+                    case Down:
+                        LcdScreenSubOption = 3;
+                        break;
+                    case Back:
+                        LcdScreenSubOption = 0;
+                        break;
+                    }
+                    break;
+
+                case 3:
+                    switch(KeyReg)
+                    {
+                    case Confirm:
+                        if(0x0F00 == ((*(__IO uint16_t *)AddrTemplateWrittenDone) & 0x0F00) )
+                        {
+                            DrawCurve((u16 *)AddrTemp[LcdScreenSubOption-1],
+                                    *((__IO uint16_t *)AddrTempSize[LcdScreenSubOption-1]));
+                            Delay_Ms(WaveTime_Ms);
+                        }
+                        else {
+                            lcd_clear(BLACK);
+                            lcd_show_string(20, 80, 24, "No Template Data!");
+                            lcd_show_string(20, 160, 24, "Do Training First!");
+                            Delay_Ms(1000);
+                        }
+                        break;
+                    case Up:
+                        LcdScreenSubOption = 2;
+                        break;
+                    case Down:
+                        LcdScreenSubOption = 4;
+                        break;
+                    case Back:
+                        LcdScreenSubOption = 0;
+                        break;
+                    }
+                    break;
+
+                case 4:
+                    switch(KeyReg)
+                    {
+                    case Confirm:
+                        if(0xF000 == ((*(__IO uint16_t *)AddrTemplateWrittenDone) & 0xF000) )
+                        {
+                            DrawCurve((u16 *)AddrTemp[LcdScreenSubOption-1],
+                                    *((__IO uint16_t *)AddrTempSize[LcdScreenSubOption-1]));
+                            Delay_Ms(WaveTime_Ms);
+
+                        }
+                        else {
+                            lcd_clear(BLACK);
+                            lcd_show_string(20, 80, 24, "No Template Data!");
+                            lcd_show_string(20, 160, 24, "Do Training First!");
+                            Delay_Ms(1000);
+                        }
+                        break;
+                    case Up:
+                        LcdScreenSubOption = 3;
+                        break;
+                    case Down:
+                        LcdScreenSubOption = 1;
+                        break;
+                    case Back:
+                        LcdScreenSubOption = 0;
+                        break;
+                    }
+                    break;
+
+                default:
+                    LcdScreenSubOption = 0;
+                    break;
+
+            }
+        }
+
+        // ChooseTemplate 主选项
+        else if(LcdScreen == ChooseTemplate)
+        {
+            // 子选项
+            if(LcdScreenSubOption == 0)
+            {
+                switch(KeyReg)
+                {
+                case Confirm:
+                    LcdScreenSubOption = 1;
+                    break;
+                case Up:
+                    LcdScreen = Waveform;
+                    break;
+                case Down:
+                    LcdScreen = RunDtw;
+                    break;
+                case Back:
+                   // LcdScreen = RunDtw;
+                    break;
+                }
+            }
+            else
+            {
+                switch(KeyReg)
+                {
+                    case Confirm:
+                        LcdScreen = RunDtw;
+                        LcdScreenSubOption = 0;
+                        lcd_clear(BLACK);
+                        lcd_show_string(40, 80, 24, "Template Chosen");
+                        lcd_show_string(0, 160, 24, "Template-%d Selected",TemplateWanted);
+                        Delay_Ms(2000);
+                        break;
+
+                    case Up:
+                        if(TemplateWanted <3)
+                        {
+                            TemplateWanted++;
+                        }
+                        else
+                        {
+                            TemplateWanted = 0;
+                        }
+                        break;
+                    case Down:
+                        if(TemplateWanted >0)
+                        {
+                            TemplateWanted--;
+                        }
+                        else {
+                            TemplateWanted = 3;
+                        }
+                        break;
+                    case Back:
+                        LcdScreen = ChooseTemplate;
+                        LcdScreenSubOption = 0;
+                        break;
+                }
+
+            }
+
+        }
+        // RunDtw 主选项
+        else if(LcdScreen == RunDtw)
+        {
+            switch(KeyReg)
+            {
+                case Confirm:
+                    if(*(__IO uint16_t *)AddrTemplateWrittenDone != 0xFFFF)
+                    {
+                        lcd_clear(BLACK);
+                        lcd_show_string(20, 80, 24, "No Template Data!");
+                        lcd_show_string(20, 160, 24, "Do Training First!");
+                        Delay_Ms(2000);
+                        LcdScreen = TemplateTraining;
+                        LcdScreenSubOption = 0;
+                        break;
+                    }
+                    else {
+                        if(mallocFlag)
+                        {
+                            for(k=0;k<4;k++)
+                            {
+                                //rt_free(TemplateDataSample[k]->p_data);
+                                //TemplateDataSample[k]->p_data = NULL;
+                            }
+                            mallocFlag = 0;
+                        }
+                        for(k=0; k<4;k++)
+                        {
+
+                        }
+                        //重新采集导轨光信号
+                        ThreshVolt = GetThreshHoldVolt();
+                        mallocFlag = 1;
+                        LcdScreenSubOption = 0;
+                        LcdScreen = Drop;
+                        DtwRun = 1;
+                        lcd_clear(BLACK);
+                        lcd_show_string(40, 80, 24, "Running DTW");
+                        Delay_Ms(2000);
+                        rt_mutex_release(mutex_lock);
+                    }
+                break;
+
+                case Up:
+                    LcdScreen = ChooseTemplate;
+                    break;
+                case Down:
+                    LcdScreen = ParameterMod;
+                    break;
+                case Back:
+                    break;
+                default: break;
+            }
+
+        }
+    }
+}
+
+void DTW_thread_entry(void *param){
+    //DTW匹配的主循环
+
+    // first rt_thread_mdelay to ensure not get mutex first
+    rt_thread_mdelay(200);
+    rt_mutex_take(mutex_lock, RT_WAITING_FOREVER);
+    while(1)
+    {
+        // get mutex
+
+        rt_kprintf("DTW_running!\r\n");
+
+        //检查ADC数据处理完成标志位
+        if(DMAProcessFlag)
+        {
+            DMAProcessFlag = 0; //重置标志位为0
+        }
+    }
+}
+
+
+void TEST_thread_entry(void *args){
+
+    while(1){
+
+        rt_kprintf("TEST!\r\n");
+
+        rt_thread_mdelay(500);
+    }
+}
+
+
+
+void peripheral_init(){
+    /*********************************************************/
+    /*****              初始化设置                                               ***********/
+    /*********************************************************/
+    /*********************************************************/
+        NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
+        GPIOPB0_INIT();     //方波信号输出引脚
+        GPIOPB1_INIT();     //气阀信号输出引脚
+        USART1_Init(115200);  //USART1初始化
+        ADC_Function_Init();  //ADC初始化
+        ADC_RegularChannelConfig(ADC1, ADC_Channel_1, 1, ADC_SampleTime_239Cycles5 ); //ADC配置
+        ADC_SoftwareStartConvCmd(ADC1, ENABLE);     //软件触发启动AD转换
+        //设置DMA1的通道，通道1从ADC接收数据到内存
+        DMA1_Init( DMA1_Channel1, (u32)&ADC1->RDATAR, (u32)p_AdcDmaData, 26);
+        DMA1Interrupt_Init();   //DMA传输中断，传输完毕后进入中断程序
+        DMA_ITConfig( DMA1_Channel1, DMA_IT_TC, ENABLE); //配置DMA通道1中断
+        //    LCD initial
+        RCC_AHBPeriphClockCmd(RCC_AHBPeriph_RNG, ENABLE);
+        RNG_Cmd(ENABLE);
+        lcd_init();
+        lcd_fill(0,0,239,239,BLACK);
+        lcd_show_string(20, 80, 24, "Press Wake_Up");
+        lcd_show_string(20, 160, 24, "To MainMenu");
+
+        DMA1_Channel1->CNTR = 0; //DMA传输数据个数置0
+        DMA_Cmd( DMA1_Channel1, ENABLE );   //使能DMA通道
+
+        TIM6->CNT=0x00;             //定时器计数先重置为0
+        TIM_Cmd(TIM6,DISABLE);       //使能定时器
+        user_timer_init();
+        rt_kprintf("after timer init\r\n");
+
+        //设置时钟中断    - 1440分频，计数50,这样就是1KHz频率的方波信号，占空比50%
+        //TIM6_Init( 50-1, 1440-1);
+        //TIM_Cmd(TIM6,ENABLE);       //使能定时器
+    /*********************************************************/
+    /*********************************************************/
+    /*********************************************************/
+    /*********************************************************/
+
+    //先获取导轨的光信号强度    ThreshVolt。
+    //Delay_Ms(200);
+    //rt_thread_mdelay(200);
+    rt_kprintf("after delay 200ms\r\n");
+    //ThreshVolt = GetThreshHoldVolt();
+    //rt_kprintf("ThreshVolt = %d\r\n",ThreshVolt);
+}
+
+int thread_sema_init(void){
+    int err;
+    rt_kprintf("init process\r\n");
+
+    /* 初始化信号量*/
+    rt_sem_init(&sem_key_lock,"key-lock",0,RT_IPC_FLAG_FIFO);
+    rt_sem_init(&sem_menu_lock,"menu-lock",0,RT_IPC_FLAG_FIFO);
+    mutex_lock = rt_mutex_create("DTW-mutex", RT_IPC_FLAG_FIFO);
+
+
+    // init test thread
+    err = rt_thread_init(&TEST_thread,                  /* 线程控制块 */
+                "TEST",                       /* 线程名字 */
+                TEST_thread_entry,            /* 线程入口函数 */
+                RT_NULL,                      /* 线程入口函数参数 */
+                &rt_TEST_thread_stack[0],     /* 线程栈起始地址 */
+                sizeof(rt_TEST_thread_stack), /* 线程栈大小 */
+                10,                            /* 线程的优先级 */
+                10);                          /* 线程时间片 */
+    if(err != RT_EOK){
+        rt_kprintf("TEST-thread init-err \r\n");
+        return -1;
+    }
+    err = rt_thread_startup(&TEST_thread);
+    RT_ASSERT(err == RT_EOK);
+
+
+    // init LCD_thread!
+    err = rt_thread_init(&LCD_thread,                  /* 线程控制块 */
+                "LCD",                       /* 线程名字 */
+                LCD_thread_entry,            /* 线程入口函数 */
+                RT_NULL,                      /* 线程入口函数参数 */
+                &rt_LCD_thread_stack[0],     /* 线程栈起始地址 */
+                sizeof(rt_LCD_thread_stack), /* 线程栈大小 */
+                10,                            /* 线程的优先级 */
+                10);                          /* 线程时间片 */
+    if(err != RT_EOK){
+        rt_kprintf("LCD-thread init-err \r\n");
+        return -1;
+    }
+    err = rt_thread_startup(&LCD_thread);
+    RT_ASSERT(err == RT_EOK);
+
+    // init dtw thread
+    err = rt_thread_init(&DTW_thread,                  /* 线程控制块 */
+                "LCD",                       /* 线程名字 */
+                DTW_thread_entry,            /* 线程入口函数 */
+                RT_NULL,                      /* 线程入口函数参数 */
+                &rt_DTW_thread_stack[0],     /* 线程栈起始地址 */
+                sizeof(rt_DTW_thread_stack), /* 线程栈大小 */
+                10,                            /* 线程的优先级 */
+                10);                          /* 线程时间片 */
+    if(err != RT_EOK){
+        rt_kprintf("DTW-thread init-err \r\n");
+        return -1;
+    }
+    err = rt_thread_startup(&DTW_thread);
+    RT_ASSERT(err == RT_EOK);
+
+
+    rt_kprintf("end process\r\n");
+
+    return 0;
+}
+
+//定时器中断程序
+static void user_timer_irq(void *args)
+{
+    //检查Laser状态标志位。实现光纤亮暗交替
+    if(1 == LaserFlag)
+    {
+        LaserFlag = LaserOff;
+    }
+
+    else {
+        LaserFlag = LaserOn;
+    }
+
+    DMA1_Channel1->CNTR = 26; //重置DMA通道1传输计数
+    TIMProcessFlag = 1;       //置标志位
+    TIM_ClearFlag(TIM6, TIM_FLAG_Update);//清除标志位，退出中断
+}
+
+void user_timer_init(){
+
+    rt_kprintf("timer init\r\n",ThreshVolt);
+    /* RT-Thread Hardware TIMER APIs */
+    rt_user_timer_attach_irq(user_timer_irq, RT_NULL);
+
+    rt_user_timer_mode();
+
+    rt_user_timer_init( 50-1, 960-1);
+
+    rt_user_timer_irq_enable();
+}
